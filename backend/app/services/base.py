@@ -26,7 +26,10 @@ class BaseModuleService:
     ) -> tuple[list[dict[str, Any]], int]:
         rows = list(store.rows(self.MODULE))
         for field, expected in (filters or {}).items():
-            if field in self.LIST_FIELDS:
+            # LIST_FIELDS 内的字段按既有约定过滤；领域扩展字段（如回执类型、
+            # 领取凭证、dist_task_id）只要行内存在也允许精确检索。
+            known = field in self.LIST_FIELDS or any(field in row for row in rows)
+            if known:
                 rows = [
                     row for row in rows
                     if expected.casefold() in str(row.get(field, "")).casefold()
@@ -51,9 +54,21 @@ class BaseModuleService:
         if missing:
             return None, missing
         rows = store.rows(self.MODULE)
-        entry = {"id": max((int(row.get("id", 0)) for row in rows), default=0) + 1}
+        generated_id = max((int(row.get("id", 0)) for row in rows), default=0) + 1
+        entry = {"id": generated_id}
+        # 先保留调用方提交的全部领域字段（资格标记、实体编码、版本标识等扩展键），
+        # 再按 LIST_FIELDS 补齐标准列；id 始终由服务端生成，不允许覆盖。
+        for key, value in values.items():
+            if key == "id":
+                continue
+            entry[key] = value
         entry.update({field: values.get(field) for field in self.LIST_FIELDS})
-        entry["status"] = self.STATUS_ORDER[0]
+        entry["id"] = generated_id
+        requested_status = values.get("status")
+        if requested_status in self.STATUS_ORDER:
+            entry["status"] = requested_status
+        else:
+            entry["status"] = self.STATUS_ORDER[0]
         entry["pending"] = True
         entry["abnormal"] = False
         rows.append(entry)
@@ -70,6 +85,13 @@ class BaseModuleService:
         entry["pending"] = target != self.STATUS_ORDER[-1]
         entry["abnormal"] = action in self.NEGATIVE_ACTIONS
         return entry, f"{self.ENTITY}已{action}"
+
+    def run_action_detailed(
+        self, entry_id: int, action: str, payload: Any = None
+    ) -> dict[str, Any]:
+        """动作的富结果版本：路由层使用，业务模块可覆盖以返回凭证/回执/阻断原因。"""
+        entry, message = self.run_action(entry_id, action)
+        return {"ok": entry is not None, "message": message, "entry": entry}
 
     def domain_snapshot(self) -> dict[str, Any]:
         """输出模块级数据质量快照，供跨模块消费和题位源码锚点使用。"""

@@ -30,6 +30,12 @@ export type PageResult = {
 export type ActionResult = {
   ok: boolean
   message: string
+  entry?: EntryRow | null
+  receipt?: EntryRow | null
+  voucher?: string
+  block_reason?: string
+  duplicated?: boolean
+  [key: string]: unknown
 }
 
 export type OverviewResult = {

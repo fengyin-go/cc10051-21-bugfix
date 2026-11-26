@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Any, Generic, TypeVar
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 T = TypeVar("T")
 
@@ -16,9 +16,19 @@ class PageResult(BaseModel, Generic[T]):
 
 
 class ActionResult(BaseModel):
+    # 领域动作会返回 receipt_id / receipt_no / voucher / block_reason /
+    # delivery_basis / reconcile 等可追查字段，统一允许透传到响应顶层。
+    model_config = ConfigDict(extra="allow")
+
     ok: bool
-    message: str
+    message: str = ""
     entry: dict[str, Any] | None = None
+    # 以下为常用显式字段（其余键通过 extra=allow 一并输出）
+    receipt: dict[str, Any] | None = None
+    voucher: str | None = None
+    block_reason: str | None = None
+    duplicated: bool | None = None
+    data: dict[str, Any] | None = None
 
 
 class EntryPayload(BaseModel):

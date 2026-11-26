@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.services import flow
 from app.store import store
 
 
@@ -22,20 +23,98 @@ class DistReceiptService(BaseModuleService):
     ACTION_RULES = {"重发回执请求": "部分回收", "标记差异": "未回收"}
     NEGATIVE_ACTIONS = []
 
+    def run_action_detailed(
+        self, entry_id: int, action: str, payload: Any = None
+    ) -> dict[str, Any]:
+        name = (action or "").strip()
+        if name in ("核对回执", "核对", "verify", "verify_receipt"):
+            result = self.verify_receipt(entry_id)
+            result.setdefault("entry", store.find(self.MODULE, entry_id))
+            return result
+        if name in ("打开", "打开回执", "查看送达依据", "open"):
+            result = self.open_delivery(entry_id)
+            result.setdefault("entry", store.find(self.MODULE, entry_id))
+            return result
+        if name == "重发回执请求":
+            result = self.resend_request(entry_id)
+            result.setdefault("entry", store.find(self.MODULE, entry_id))
+            return result
+        if name == "标记差异":
+            diff = ""
+            if payload is not None:
+                diff = str(getattr(payload, "remark", None)
+                           or (payload.get("remark") if isinstance(payload, dict) else "")
+                           or "")
+            message = self.mark_diff(entry_id, diff or "人工标记差异")
+            entry = store.find(self.MODULE, entry_id)
+            return {"ok": True, "message": message, "entry": entry}
+        return super().run_action_detailed(entry_id, action, payload)
+
     # ---- 业务扩展：回执核对与差异处置 ----
 
     def verify_receipt(self, entry_id: int) -> dict[str, Any]:
-        """核对回执：按分发批次校验记录数一致性。"""
+        """核对回执：按回执类型与分发任务真实身份校验一致性。"""
         entry = store.find(self.MODULE, entry_id)
         if entry is None:
             return {"ok": False, "message": "回执记录不存在"}
         batch = entry.get("分发批次", "")
-        task = next((t for t in store.rows("dist_task")
-                     if t.get("分发批次") == batch), None)
+        tid = entry.get("dist_task_id", entry.get("分发任务ID"))
+        task = None
+        try:
+            if tid not in (None, ""):
+                task = store.find("dist_task", int(tid))
+        except (TypeError, ValueError):
+            task = None
+        if task is None and batch:
+            task = next((t for t in store.rows("dist_task")
+                         if t.get("分发批次") == batch), None)
+        rtype = entry.get("回执类型", flow.DELIVERY_RECEIPT)
+
         if task is None:
             entry["status"] = "未回收"
-            entry["差异说明"] = "分发批次不存在"
-            return {"ok": False, "message": f"分发批次 {batch} 不存在"}
+            entry["差异说明"] = "分发批次不存在或缺少分发任务真实身份"
+            return {"ok": False, "message": f"分发批次 {batch} 不存在，回执不可追查"}
+
+        if rtype == flow.DELIVERY_RECEIPT:
+            confirmed = (
+                task.get("status") == "已送达"
+                and (task.get("delivery_receipt_id") == entry.get("id")
+                     or task.get("delivery_receipt_no") == entry.get("回执编号")
+                     or entry.get("送达依据"))
+            )
+            if confirmed:
+                entry["status"] = "已回收"
+                entry["pending"] = False
+                return {"ok": True, "message": "送达回执与真实送达确认一致",
+                        "receipt": entry, "entry": entry}
+            entry["status"] = "部分回收"
+            entry["差异说明"] = f"缺少真实送达确认（分发状态为 {task.get('status')}）"
+            return {"ok": False, "message": "回执缺少对应的真实送达确认，不能作为送达依据",
+                    "entry": entry}
+
+        if rtype == flow.WITHDRAW_RECEIPT:
+            consistent = (
+                task.get("凭证状态") == "已撤回"
+                or (task.get("status") == "分发失败"
+                    and task.get("withdraw_receipt_id") == entry.get("id"))
+            )
+            if consistent:
+                entry["status"] = "已回收"
+                entry["pending"] = False
+                return {"ok": True, "message": "撤回处置与领取凭证作废记录一致",
+                        "receipt": entry, "entry": entry}
+            return {"ok": False, "message": "撤回回执与任务处置状态不一致", "entry": entry}
+
+        if rtype == flow.CORRECTION_RECEIPT:
+            related_id = entry.get("关联回执ID")
+            original = store.find("dist_receipt", int(related_id)) if related_id else None
+            if original is not None and task.get("status") == "已送达":
+                entry["status"] = "已回收"
+                entry["pending"] = False
+                return {"ok": True, "message": "更正回执关联到真实送达依据，可追查",
+                        "receipt": entry, "entry": entry}
+            return {"ok": False, "message": "更正回执缺少可关联的原始送达回执", "entry": entry}
+
         if task.get("status") == "已送达":
             entry["status"] = "已回收"
             entry["pending"] = False
@@ -43,6 +122,24 @@ class DistReceiptService(BaseModuleService):
         entry["status"] = "部分回收"
         entry["差异说明"] = f"分发状态为 {task.get('status')}"
         return {"ok": False, "message": "回执与分发结果不一致"}
+
+    def open_delivery(self, entry_id: int) -> dict[str, Any]:
+        """回执中心只允许把真实确认过的送达记录作为「送达依据」打开。"""
+        entry = store.find(self.MODULE, entry_id)
+        if entry is None:
+            return {"ok": False, "message": "回执记录不存在"}
+        checked = self.verify_receipt(entry_id)
+        if entry.get("回执类型", flow.DELIVERY_RECEIPT) != flow.DELIVERY_RECEIPT:
+            return {"ok": False, "code": "not_delivery_receipt",
+                    "message": "该记录是撤回/更正回执，不是送达确认记录，不能作为送达依据打开",
+                    "entry": entry}
+        if not checked.get("ok"):
+            return {"ok": False, "code": "unverified_delivery",
+                    "message": checked.get("message", "回执未经真实送达确认"),
+                    "entry": entry}
+        return {"ok": True, "message": "真实送达记录", "receipt": entry,
+                "delivery_basis": entry.get("送达依据") or entry.get("回执编号"),
+                "entry": entry}
 
     def mark_diff(self, entry_id: int, diff: str) -> str:
         """标记回执差异并把分发任务置为失败重试。"""
